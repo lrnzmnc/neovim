@@ -31,7 +31,6 @@ local function get_viewport(bufnr)
   local ranges = {} -- Optimizable?
 
   for _, win in ipairs(wins) do
-    -- local cw = api.nvim_get_current_win()
     if api.nvim_win_get_buf(win) == bufnr then
       local start_row, end_row, win_id
       local end_col = 0 -- TODO: Fix this!
