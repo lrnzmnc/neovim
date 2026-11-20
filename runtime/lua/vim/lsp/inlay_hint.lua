@@ -1,7 +1,4 @@
 --[[
--- TODO: Make it so the request is delayed until the scroll is stopped for a bit.
---       if the user keep scrolling up and down continuosly without stop we should not compute inlay
---       hint
 -- TODO: Start writing test for new implemented viewport related method
 --]]
 local api = vim.api
@@ -47,11 +44,6 @@ local function get_viewport(bufnr)
       end)
     end
   end
-  -- This make it work ONLY for the focused window, it could be good for extra performance but can
-  -- not be used for every situation, like maybe I want to check difference in hint between two win
-  -- at the same moment?
-
-  -- return win_id, start_row, end_row, end_col
   return ranges
 end
 
