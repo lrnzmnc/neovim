@@ -1,7 +1,14 @@
+--[[
+-- TODO: Make it so the request is delayed until the scroll is stopped for a bit.
+--       if the user keep scrolling up and down continuosly without stop we should not compute inlay
+--       hint
+-- TODO: Start writing test for new implemented viewport related method
+--]]
 local api = vim.api
 local log = require('vim.lsp.log')
 local nvim_on = require('vim._core.util').nvim_on
 local util = require('vim.lsp.util')
+local timer = vim.uv.new_timer()
 
 local Capability = require('vim.lsp._capability')
 
@@ -15,39 +22,37 @@ local function same_range(a, b)
     and a['end'].character == b['end'].character
 end
 
+--- TODO: Now we get the range per win
+---       we should pass this as an argument to the refresh
+---       (or it work like that?)
+---       in any case we should pass it as an argument to implement cache
 local function get_viewport(bufnr)
-  local start_row, end_row
-  local end_col = 0
-  for _, win in ipairs(api.nvim_list_wins()) do
-    if api.nvim_win_get_buf(win) == bufnr then
-      local f = vim.fn.line('w0', win) - 1 -- First visible line of the win
-      local l = vim.fn.line('w$', win) -- Last visible line of the win
+  local wins = api.nvim_list_wins()
+  local ranges = {} -- Optimizable?
 
-      -- NOTE:  This calculate union of the range from all win with the same buffer
-      --
-      --        Example:
-      --          win A, bufnr 1 -> f = 5,   l = 37
-      --          win B, bufnr 2 -> f = 169, l = 201
-      --          start_row = 5, end_row = 201
-      --        That means client:request('textDocument/InlayHint', ...) from InlayHint:refresh()
-      --        should calculate a whole 100+ line of inlayHint for nothing.
-      --        This is indeed much cheaper than request the inlayHint for the full window (at least
-      --        in large file)
-      --
-      --        Solution could be to keep each visible range win related and send one request for
-      --        range, like:
-      --
-      --        ranges[#ranges + 1] = {
-      --             start = first,
-      --             finish = last,
-      --             }
-      --
-      start_row = start_row and math.min(start_row, f) or f
-      end_row = end_row and math.max(end_row, l) or l
+  for _, win in ipairs(wins) do
+    -- local cw = api.nvim_get_current_win()
+    if api.nvim_win_get_buf(win) == bufnr then
+      local start_row, end_row, win_id
+      local end_col = 0 -- TODO: Fix this!
+      api.nvim_win_call(win, function()
+        local f = vim.fn.line('w0', win) - 1 -- First visible line of the win
+        local l = vim.fn.line('w$', win) -- Last visible line of the win
+        local w = win -- win id
+        start_row = start_row and math.min(start_row, f) or f
+        end_row = end_row and math.max(end_row, l) or l
+        win_id = w
+
+        table.insert(ranges, { sr = start_row, er = end_row, ec = end_col, wi = win_id })
+      end)
     end
   end
+  -- This make it work ONLY for the focused window, it could be good for extra performance but can
+  -- not be used for every situation, like maybe I want to check difference in hint between two win
+  -- at the same moment?
 
-  return start_row, end_row, end_col
+  -- return win_id, start_row, end_row, end_col
+  return ranges
 end
 
 ---@class (private) vim.lsp.inlay_hint.LineHints
@@ -63,7 +68,8 @@ end
 ---@class (private) vim.lsp.inlay_hint.ActiveRequest
 ---@field request_id? integer the LSP request ID of the most recent request sent to the server
 ---@field version? integer the document version associated with the most recent request
----@field range? lsp.Range
+---@field range? lsp.Range active request win visible range viewport
+---@field win_id? integer win id of currrente active request
 ---@class (private) vim.lsp.inlay_hint.ClientState Buffer local state for inlay hints
 ---@field namespace integer
 ---@field active_request vim.lsp.inlay_hint.ActiveRequest
@@ -92,6 +98,9 @@ function InlayHint:new(bufnr)
     end
   end)
 
+  -- TODO: here we should fire the event only for lsp related win
+  --       for example if :copen it should not fire this autocmd
+  --       at the moment it throw a warning/error
   nvim_on({ 'WinScrolled', 'WinResized', 'WinEnter' }, self.augroup, {}, function(args)
     local win = tonumber(args.match) or api.nvim_get_current_win()
     if not api.nvim_win_is_valid(win) then
@@ -103,7 +112,17 @@ function InlayHint:new(bufnr)
     end
 
     for client_id, _ in pairs(self.client_state) do
-      self:refresh(client_id)
+      timer:stop()
+      -- self:refresh is delayed until the user stop scrolling for the given timeout value
+      timer:start(
+        150,
+        0,
+        vim.schedule_wrap(function()
+          self:refresh(client_id)
+        end)
+      )
+
+      -- self:refresh(client_id)
     end
   end)
 
@@ -172,42 +191,51 @@ function InlayHint:refresh(client_id)
     local current_result = state.current_result
     local active_request = state.active_request
 
-    local start_line, end_line, end_col = get_viewport(self.bufnr)
+    for _, r in ipairs(get_viewport(self.bufnr)) do
+      local start_line, end_line, end_col, win_id = r.sr, r.er, r.ec, r.wi
+      -- This is not the perfect solution but is needed to get range from buffer with 'noeol' set.
+      if vim.bo[self.bufnr].eol == false then
+        start_line = 0
+        end_line = api.nvim_buf_line_count(self.bufnr) - 1
+        end_col = #api.nvim_buf_get_lines(self.bufnr, end_line, end_line + 1, false)[1]
+      end
+      range = vim.range(self.bufnr, start_line, 0, end_line, end_col):to_lsp(client.offset_encoding)
+      print(
+        string.format(
+          'InlayHInt:refres() >> %d | %d | %d | %d',
+          win_id,
+          start_line,
+          end_line,
+          end_col
+        )
+      )
+      -- Skip if the current result already covers this version and range
+      if current_result.version == version and same_range(current_result.range, range) then
+        return
+      end
 
-    -- This is not the perfect solution but is needed to get range from buffer with 'noeol' set.
-    if vim.bo[self.bufnr].eol == false then
-      start_line = 0
-      end_line = api.nvim_buf_line_count(self.bufnr) - 1
-      end_col = #api.nvim_buf_get_lines(self.bufnr, end_line, end_line + 1, false)[1]
-      print(start_line, end_line, end_col)
-    end
+      -- Skip if an identical request is already in-flight
+      if active_request.version == version and same_range(active_request.range, range) then
+        return
+      end
 
-    range = vim.range(self.bufnr, start_line, 0, end_line, end_col):to_lsp(client.offset_encoding)
+      -- cancel stale in-flight request
+      self:cancel_active_request(client_id)
 
-    -- Skip if the current result already covers this version and range
-    if current_result.version == version and same_range(current_result.range, range) then
-      return
-    end
+      local params = {
+        textDocument = util.make_text_document_params(self.bufnr),
+        range = range,
+      }
 
-    -- Skip if an identical request is already in-flight
-    if active_request.version == version and same_range(active_request.range, range) then
-      return
-    end
+      -- print(string.format('%d | %d | %d|', win_id, start_line, end_line, end_col))
+      local succes, request_id = client:request('textDocument/inlayHint', params, nil, self.bufnr)
 
-    -- cancel stale in-flight request
-    self:cancel_active_request(client_id)
-
-    local params = {
-      textDocument = util.make_text_document_params(self.bufnr),
-      range = range,
-    }
-
-    local succes, request_id = client:request('textDocument/inlayHint', params, nil, self.bufnr)
-
-    if succes then
-      active_request.request_id = request_id
-      active_request.version = version
-      active_request.range = range
+      if succes then
+        active_request.request_id = request_id
+        active_request.version = version
+        active_request.range = range
+        active_request.win_id = win_id
+      end
     end
   end
 end
